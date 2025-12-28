@@ -6,7 +6,7 @@
 
 
 ## Demo
-![alt text](assets/demo.png)
+![alt text](assets/image.png)
 
 ## ✨ 功能特性
 
