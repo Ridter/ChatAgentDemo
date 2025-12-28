@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed/dir"],
+      "allowedTools": ["read_file", "write_file", "list_directory"]
+    },
+    "context7": {
+      "type": "http",
+      "url": "https://mcp.context7.com/mcp",
+      "headers": {
+        "CONTEXT7_API_KEY": "your-api-key"
+      },
+      "allowedTools": ["resolve-library-id", "get-library-docs"]
+    }
+  }
+}

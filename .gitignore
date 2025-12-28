@@ -1,0 +1,49 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.uv/
+
+# Environment
+.env
+.env.local
+.env.*.local
+.python-version
+
+# Build
+dist/
+build/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Testing
+coverage/
+.pytest_cache/
+
+# Misc
+*.local
+.cache/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+backend/data/*
+!backend/data/*.example.json
