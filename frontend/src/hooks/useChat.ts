@@ -502,7 +502,7 @@ export function useChat(options: UseChatOptions) {
                 messages: updatedMessages,
                 isStreaming: false,
                 streamingMessageId: null,
-                isLoading: false,  // 流式结束，loading 也结束
+                isLoading: true,  // 流式文本结束，但 AI 可能还在进行工具调用，保持 loading 状态
               })
               notifyCacheUpdate()
             }

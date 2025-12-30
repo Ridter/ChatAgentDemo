@@ -4,7 +4,17 @@
 
 import { useState, useEffect } from 'react'
 
-const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8000'
+// 动态获取 WebSocket URL：优先使用环境变量，否则基于当前页面 host 自动推断
+function getWsUrl(): string {
+  if (import.meta.env.VITE_WS_URL) {
+    return import.meta.env.VITE_WS_URL
+  }
+  // 根据当前页面协议和 host 自动构建 WebSocket URL
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return `${protocol}//${window.location.host}`
+}
+
+const WS_URL = getWsUrl()
 
 // 连接状态管理器（单例）
 class ConnectionManager {

@@ -110,11 +110,22 @@ def get_logger(name: str) -> logging.Logger:
 
 
 def enable_debug_mode():
-    """启用调试模式，将日志级别设为 DEBUG"""
+    """启用调试模式，将日志级别设为 DEBUG
+
+    只对应用自身的 logger 启用 DEBUG，数据库等第三方库保持 INFO 级别
+    """
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.DEBUG)
     for handler in root_logger.handlers:
         handler.setLevel(logging.DEBUG)
+
+    # 禁用数据库相关的 debug 日志
+    logging.getLogger('aiosqlite').setLevel(logging.INFO)
+    logging.getLogger('sqlite3').setLevel(logging.INFO)
+
+    # 禁用其他不需要 debug 的模块
+    logging.getLogger('asyncio').setLevel(logging.INFO)
+    logging.getLogger('websockets').setLevel(logging.INFO)
 
 
 # 项目根目录
@@ -131,7 +142,7 @@ DATABASE_PATH = DATA_DIR / "chat.db"
 MCP_CONFIG_PATH = DATA_DIR / "mcp_servers.json"
 
 # 服务器配置
-HOST = os.getenv("HOST", "0.0.0.0")
+HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "3001"))
 
 # Claude Agent SDK 配置
@@ -146,7 +157,7 @@ SYSTEM_PROMPT = """你是一个友好、专业的 AI 助手。你可以帮助用
 
 ALLOWED_TOOLS = [
     # 基础工具
-    "Bash",
+    #"Bash",
     "Read",
     "Write",
     "Edit",
@@ -159,5 +170,11 @@ ALLOWED_TOOLS = [
 
 MAX_TURNS = 100
 
-# 权限模式：自动接受编辑操作
+# 权限模式
+# 可选值: "default" | "acceptEdits" | "plan" | "bypassPermissions"
+# - default: 需要用户确认
+# - acceptEdits: 自动接受文件编辑，但 allowed_tools 白名单仍然生效
+# - plan: 只生成计划不执行
+# - bypassPermissions: 跳过所有权限检查（包括 allowed_tools 白名单）
+# 注意：使用 bypassPermissions 会导致 allowed_tools 配置无效
 PERMISSION_MODE = "acceptEdits"

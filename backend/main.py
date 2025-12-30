@@ -13,11 +13,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
-from app.config import HOST, PORT, get_logger, enable_debug_mode
+from app.config import HOST, PORT, MCP_CONFIG_PATH, get_logger, enable_debug_mode
 from app.models.database import init_db
 from app.api.routes import router as api_router
 from app.api.websocket import router as ws_router
 from app.core.session_manager import session_manager
+from app.core.mcp_loader import mcp_config_manager
 
 logger = get_logger(__name__)
 
@@ -36,7 +37,20 @@ async def lifespan(app: FastAPI):
     await init_db()
     logger.info("数据库初始化完成")
 
+    # 初始化 MCP 配置管理器并启动文件监控
+    mcp_config_manager.initialize(MCP_CONFIG_PATH)
+    await mcp_config_manager.start_watching(interval=2.0)
+    logger.info("MCP 配置管理器初始化完成，文件监控已启动")
+
+    # 注册 MCP 配置重载回调，当配置变化时重建所有会话
+    session_manager._register_mcp_reload_callback()
+    logger.info("MCP 配置重载回调已注册")
+
     yield
+
+    # 关闭时停止 MCP 文件监控
+    await mcp_config_manager.stop_watching()
+    logger.info("MCP 文件监控已停止")
 
     # 关闭时清理所有会话
     await session_manager.close_all()

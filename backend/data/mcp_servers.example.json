@@ -12,7 +12,7 @@
       "headers": {
         "CONTEXT7_API_KEY": "your-api-key"
       },
-      "allowedTools": ["resolve-library-id", "get-library-docs"]
+      "allowedTools": ["resolve-library-id", "query-docs"]
     }
   }
 }

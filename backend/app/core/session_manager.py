@@ -3,11 +3,12 @@ import asyncio
 import json
 from typing import Any
 from fastapi import WebSocket
-from claude_agent_sdk import AssistantMessage, UserMessage, TextBlock, ToolUseBlock, ToolResultBlock, ResultMessage
+from claude_agent_sdk import AssistantMessage, UserMessage, TextBlock, ToolUseBlock, ToolResultBlock, ResultMessage, SystemMessage
 from claude_agent_sdk.types import StreamEvent
 from app.core.agent_session import AgentSession
 from app.services.chat_store import chat_store
 from app.config import get_logger
+from app.core.mcp_loader import mcp_config_manager, MCPConfig
 
 logger = get_logger(__name__)
 
@@ -35,6 +36,7 @@ class Session:
         self._resume_session_id = resume_session_id  # 保存恢复的会话 ID
         self._is_processing = False  # 是否正在处理查询
         self._pending_messages: list[dict] = []  # 待发送的消息队列（当没有订阅者时缓存）
+        self._needs_rebuild = False  # 是否需要在查询完成后重建 AgentSession
 
     @property
     def sdk_session_id(self) -> str | None:
@@ -82,11 +84,19 @@ class Session:
             })
             return
 
+        # 处理 SystemMessage（SDK 初始化消息）
+        if isinstance(message, SystemMessage):
+            # 检查 API key 状态
+            data = getattr(message, 'data', {}) or {}
+            api_key_source = data.get('apiKeySource', '')
+            if api_key_source == 'none':
+                logger.warning("API key not configured")
+            return
+
         # 处理 StreamEvent（流式输出）
         if isinstance(message, StreamEvent):
             event = message.event
             event_type = event.get("type", "")
-            logger.debug(f"StreamEvent: type={event_type}, event={event}")
 
             # 处理文本增量
             if event_type == "content_block_delta":
@@ -95,7 +105,6 @@ class Session:
                     text = delta.get("text", "")
                     if text:
                         self._current_text_buffer += text
-                        # 发送流式文本增量
                         await self.broadcast({
                             "type": "text_delta",
                             "delta": text,
@@ -105,9 +114,7 @@ class Session:
             # 内容块开始
             elif event_type == "content_block_start":
                 content_block = event.get("content_block", {})
-                logger.debug(f"content_block_start: content_block={content_block}")
                 if content_block.get("type") == "text":
-                    # 重置文本缓冲区
                     self._current_text_buffer = ""
                     await self.broadcast({
                         "type": "stream_start",
@@ -116,9 +123,7 @@ class Session:
 
             # 内容块结束
             elif event_type == "content_block_stop":
-                logger.debug(f"content_block_stop: current_text_buffer length={len(self._current_text_buffer)}")
                 if self._current_text_buffer:
-                    # 存储完整消息到数据库
                     await chat_store.add_message(self.chat_id, "assistant", self._current_text_buffer)
                     await self.broadcast({
                         "type": "stream_end",
@@ -132,6 +137,13 @@ class Session:
         if isinstance(message, AssistantMessage):
             content = message.content
 
+            # 检查是否有错误属性
+            error = getattr(message, 'error', None)
+            if error:
+                self._is_processing = False
+                await self._broadcast_error(str(error))
+                return
+
             if isinstance(content, str):
                 # 如果没有通过流式输出，则存储并广播完整消息
                 if not self._current_text_buffer:
@@ -142,12 +154,12 @@ class Session:
                         "chat_id": self.chat_id,
                     })
             elif isinstance(content, list):
+                # 处理 TextBlock 列表（非流式情况下的文本）
+                text_content = ""
                 for block in content:
                     if isinstance(block, TextBlock):
-                        # 跳过已通过流式输出的文本
-                        pass
+                        text_content += block.text
                     elif isinstance(block, ToolUseBlock):
-                        # 存储工具调用到数据库
                         await chat_store.add_tool_use(
                             self.chat_id, block.id, block.name, block.input
                         )
@@ -159,15 +171,12 @@ class Session:
                             "chat_id": self.chat_id,
                         })
                     elif isinstance(block, ToolResultBlock):
-                        # 处理工具执行结果
                         result_content = block.content
-                        # 如果内容是列表，尝试提取文本
                         if isinstance(result_content, list):
                             result_content = "\n".join(
                                 str(item.get("text", item)) if isinstance(item, dict) else str(item)
                                 for item in result_content
                             )
-                        # 更新工具调用结果到数据库
                         await chat_store.update_tool_result(
                             block.tool_use_id, result_content, block.is_error or False
                         )
@@ -179,25 +188,30 @@ class Session:
                             "chat_id": self.chat_id,
                         })
 
+                # 如果收集到了文本内容且没有通过流式输出，则广播
+                if text_content and not self._current_text_buffer:
+                    await chat_store.add_message(self.chat_id, "assistant", text_content)
+                    await self.broadcast({
+                        "type": "assistant_message",
+                        "content": text_content,
+                        "chat_id": self.chat_id,
+                    })
+
         # 处理 UserMessage（包含工具执行结果）
         elif isinstance(message, UserMessage):
             content = message.content
             if isinstance(content, list):
                 for block in content:
                     if isinstance(block, ToolResultBlock):
-                        # 处理工具执行结果
                         result_content = block.content
-                        # 如果内容是列表，尝试提取文本
                         if isinstance(result_content, list):
                             result_content = "\n".join(
                                 str(item.get("text", item)) if isinstance(item, dict) else str(item)
                                 for item in result_content
                             )
-                        # 更新工具调用结果到数据库
                         await chat_store.update_tool_result(
                             block.tool_use_id, result_content, block.is_error or False
                         )
-                        logger.info(f"Broadcasting tool_result for tool_id: {block.tool_use_id}")
                         await self.broadcast({
                             "type": "tool_result",
                             "tool_id": block.tool_use_id,
@@ -208,8 +222,24 @@ class Session:
 
         # 处理 ResultMessage
         elif isinstance(message, ResultMessage):
-            # 标记处理完成
             self._is_processing = False
+
+            subtype = getattr(message, 'subtype', None)
+            is_error = getattr(message, 'is_error', False)
+            result = getattr(message, 'result', None)
+            error_message = getattr(message, 'error', None) or getattr(message, 'error_message', None)
+
+            # 如果 is_error=True，使用 result 作为错误消息广播
+            if is_error and result:
+                logger.warning(f"Query error: {result}")
+                await self._broadcast_error(str(result))
+                return
+
+            # 如果是错误结果（subtype != success），广播错误消息
+            if subtype and subtype != "success" and error_message:
+                logger.warning(f"Query failed: {error_message}")
+                await self._broadcast_error(str(error_message))
+                return
 
             # 保存 SDK session ID 到数据库（用于服务重启后恢复）
             # session_id 在 agent_session._run_query 中从 ResultMessage 提取并保存到 _session_id
@@ -220,11 +250,16 @@ class Session:
 
             await self.broadcast({
                 "type": "result",
-                "success": message.subtype == "success" if hasattr(message, 'subtype') else True,
+                "success": not is_error and (subtype == "success" if subtype else True),
                 "chat_id": self.chat_id,
                 "cost": message.total_cost_usd if hasattr(message, 'total_cost_usd') else None,
                 "duration": message.duration_ms if hasattr(message, 'duration_ms') else None,
             })
+
+            # 检查是否需要重建 AgentSession（MCP 配置在查询期间发生了变化）
+            if self._needs_rebuild:
+                logger.info(f"[REBUILD] Query completed, rebuilding AgentSession for {self.chat_id} due to MCP config change")
+                await self.rebuild_agent_session()
 
     async def send_message(self, content: str, images: list[dict] | None = None) -> None:
         """发送用户消息给 Agent
@@ -415,12 +450,125 @@ class Session:
             self._listen_task.cancel()
         await self._agent_session.close()
 
+    async def rebuild_agent_session(self) -> None:
+        """重建 AgentSession（用于 MCP 配置热更新）
+
+        当 MCP 配置变化时，需要重建 AgentSession 以使用新的配置。
+        会保留原来的 SDK session ID，以便恢复对话历史。
+        """
+        # 停止当前的监听任务
+        if self._listen_task and not self._listen_task.done():
+            self._listen_task.cancel()
+            try:
+                await self._listen_task
+            except asyncio.CancelledError:
+                pass
+        self._is_listening = False
+        self._listen_task = None
+
+        # 保存当前的 SDK session ID（用于恢复对话历史）
+        old_session_id = self._agent_session.session_id
+
+        # 关闭旧的 AgentSession
+        await self._agent_session.close()
+
+        # 创建新的 AgentSession，传入旧的 session ID 以恢复对话历史
+        if old_session_id:
+            self._agent_session = AgentSession(resume_session_id=old_session_id)
+            logger.info(f"[REBUILD] AgentSession rebuilt for chat {self.chat_id}, resuming from session {old_session_id}")
+        else:
+            self._agent_session = AgentSession()
+            logger.info(f"[REBUILD] AgentSession rebuilt for chat {self.chat_id} (no previous session to resume)")
+
+        # 重置状态
+        self._current_text_buffer = ""
+        self._is_processing = False
+        self._pending_messages.clear()
+        self._needs_rebuild = False
+
+    def mark_needs_rebuild(self) -> None:
+        """标记此 session 需要在当前查询完成后重建 AgentSession"""
+        self._needs_rebuild = True
+        logger.debug(f"Session {self.chat_id} marked for rebuild")
+
 
 class SessionManager:
     """会话管理器，管理所有聊天会话"""
 
     def __init__(self):
         self._sessions: dict[str, Session] = {}
+        self._mcp_reload_registered = False
+        self._last_mcp_servers: set[str] = set()  # 用于检测 MCP 服务器变化
+
+    def _register_mcp_reload_callback(self) -> None:
+        """注册 MCP 配置重载回调
+
+        注意：由于使用了 PreToolUse hook 进行动态权限检查，
+        allowedTools 的变更会立即生效，无需重建 session。
+
+        只有当 MCP 服务器配置本身发生变化（添加/删除服务器）时，
+        才需要重建 session。
+        """
+        if self._mcp_reload_registered:
+            return
+
+        def on_mcp_reload(config: MCPConfig) -> None:
+            """MCP 配置重载时的回调"""
+            current_servers = set(config.servers.keys())
+            servers_changed = current_servers != self._last_mcp_servers
+
+            logger.info(f"[MCP_RELOAD] Config changed, servers_changed: {servers_changed}")
+
+            # 更新服务器列表记录
+            self._last_mcp_servers = current_servers
+
+            # 如果只是 allowedTools 变化，不需要重建 session
+            if not servers_changed:
+                logger.info("[MCP_RELOAD] Only allowedTools changed, no rebuild needed")
+                return
+
+            # MCP 服务器列表发生变化，需要重建 session
+            logger.info(f"[MCP_RELOAD] Servers changed, rebuilding {len(self._sessions)} sessions")
+
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._rebuild_all_sessions())
+            except RuntimeError as e:
+                logger.warning(f"[MCP_RELOAD] No running event loop: {e}")
+
+        mcp_config_manager.on_reload(on_mcp_reload)
+        self._mcp_reload_registered = True
+        logger.info("Registered MCP config reload callback (dynamic permissions via PreToolUse hook)")
+
+    async def _rebuild_all_sessions(self) -> None:
+        """重建所有会话的 AgentSession"""
+        logger.info(f"_rebuild_all_sessions called, checking {len(self._sessions)} sessions")
+
+        if not self._sessions:
+            logger.info("No active sessions to rebuild")
+            return
+
+        rebuild_tasks = []
+        for chat_id, session in self._sessions.items():
+            logger.info(f"Checking session {chat_id}, is_processing: {session.is_processing()}")
+            # 只重建没有正在处理查询的会话
+            if not session.is_processing():
+                logger.info(f"Will rebuild session {chat_id}")
+                rebuild_tasks.append(session.rebuild_agent_session())
+            else:
+                # 标记正在处理的 session，让它在查询完成后自动重建
+                session.mark_needs_rebuild()
+
+        if rebuild_tasks:
+            logger.info(f"Starting rebuild of {len(rebuild_tasks)} sessions...")
+            results = await asyncio.gather(*rebuild_tasks, return_exceptions=True)
+            # 检查是否有异常
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    logger.error(f"Error rebuilding session: {result}")
+            logger.info(f"Rebuilt {len(rebuild_tasks)} sessions with new MCP config")
+        else:
+            logger.info("No sessions need rebuilding (all are processing or none exist)")
 
     def get_or_create_session(
         self,

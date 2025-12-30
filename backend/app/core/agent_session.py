@@ -9,12 +9,51 @@ from claude_agent_sdk import (
     TextBlock,
     ToolUseBlock,
     ResultMessage,
+    HookMatcher,
+    HookInput,
+    HookContext,
+    HookJSONOutput,
 )
 from claude_agent_sdk.types import StreamEvent
 from app.config import SYSTEM_PROMPT, ALLOWED_TOOLS, MAX_TURNS, PERMISSION_MODE, MCP_CONFIG_PATH, get_logger
-from app.core.mcp_loader import load_mcp_servers, MCPConfig
+from app.core.mcp_loader import mcp_config_manager, MCPConfig
 
 logger = get_logger(__name__)
+
+
+def create_dynamic_permission_hook():
+    """创建动态权限检查 hook
+
+    这个 hook 会在每次工具调用时检查当前的 MCP 配置，
+    实现工具权限的动态更新，而不需要重建整个 session。
+    """
+    async def check_tool_permission(
+        input_data: HookInput,
+        tool_use_id: str | None,
+        context: HookContext
+    ) -> HookJSONOutput:
+        tool_name = input_data["tool_name"]
+
+        # 获取当前最新的 MCP 配置
+        mcp_config = mcp_config_manager.get_config()
+
+        # 合并基础工具和 MCP 工具权限
+        all_allowed_tools = set(ALLOWED_TOOLS + mcp_config.allowed_tools)
+
+        # 检查工具是否在允许列表中
+        if tool_name not in all_allowed_tools:
+            logger.warning(f"[PreToolUse] 拒绝工具 '{tool_name}'")
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": f"工具 '{tool_name}' 未被授权使用",
+                }
+            }
+
+        return {}
+
+    return check_tool_permission
 
 
 class AgentSession:
@@ -34,21 +73,34 @@ class AgentSession:
             resume_session_id: 要恢复的会话 ID，如果为 None 则创建新会话
             fork_session: 是否从原会话分叉到新会话 ID（仅在 resume_session_id 不为 None 时有效）
         """
-        # 加载 MCP 服务器配置
-        mcp_config = load_mcp_servers(MCP_CONFIG_PATH)
+        # 从配置管理器获取 MCP 配置（支持热更新）
+        mcp_config = mcp_config_manager.get_config()
+
+        # 记录当前配置
+        logger.info(f"[AgentSession] 初始化，MCP 服务器: {list(mcp_config.servers.keys())}")
+
+        # 创建动态权限检查 hook
+        permission_hook = create_dynamic_permission_hook()
 
         # 合并基础工具和 MCP 工具权限
+        # SDK 需要 allowed_tools 作为第一层白名单，PreToolUse hook 作为第二层动态检查
         all_allowed_tools = ALLOWED_TOOLS + mcp_config.allowed_tools
 
         # 构建 ClaudeAgentOptions
         options_kwargs = {
             "system_prompt": SYSTEM_PROMPT,
             "max_turns": MAX_TURNS,
-            "allowed_tools": all_allowed_tools,
             "permission_mode": PERMISSION_MODE,
+            "allowed_tools": all_allowed_tools,  # SDK 第一层权限检查
             "include_partial_messages": True,  # 启用流式输出
             "mcp_servers": mcp_config.servers if mcp_config.servers else None,
             "stderr": lambda msg: logger.warning(f"CLI stderr: {msg}"),
+            # PreToolUse hook 实现动态权限检查（第二层，用于热更新后的权限变更）
+            "hooks": {
+                "PreToolUse": [
+                    HookMatcher(matcher="*", hooks=[permission_hook]),
+                ],
+            },
         }
 
         # 如果指定了恢复会话 ID，添加 resume 参数
@@ -89,6 +141,38 @@ class AgentSession:
                 else:
                     logger.info("ClaudeSDKClient initialized (new session)")
             return self._client
+
+    async def _close_client(self, context: str = "") -> None:
+        """关闭 ClaudeSDKClient
+
+        统一处理客户端关闭逻辑，包括 anyio cancel scope 和 SIGINT 错误处理。
+
+        Args:
+            context: 调用上下文描述，用于日志记录
+        """
+        if self._client is None:
+            return
+
+        log_prefix = f"ClaudeSDKClient closed{f' ({context})' if context else ''}"
+        try:
+            await self._client.__aexit__(None, None, None)
+            logger.info(log_prefix)
+        except RuntimeError as e:
+            # 忽略 "cancel scope in a different task" 错误
+            # 这在 reset/close 时是预期的行为
+            if "cancel scope" in str(e):
+                logger.debug(f"{log_prefix} with expected task context warning: {e}")
+            else:
+                logger.warning(f"Error closing ClaudeSDKClient: {e}")
+        except Exception as e:
+            error_str = str(e)
+            # 忽略 SIGINT (exit code -2) 导致的错误
+            if "exit code -2" in error_str or "exit code: -2" in error_str:
+                logger.debug(f"{log_prefix} due to SIGINT")
+            else:
+                logger.warning(f"Error closing ClaudeSDKClient: {e}")
+        finally:
+            self._client = None
 
     async def send_message(self, content: str, images: list[dict] | None = None) -> None:
         """发送消息给 Agent 并处理响应
@@ -277,10 +361,12 @@ class AgentSession:
             # 发送消息
             if images and len(images) > 0:
                 # 有图片时，使用多模态消息格式
-                logger.info(f"Sending multimodal message with {len(images)} image(s)")
-                await client.query(self._create_multimodal_message(content, images))
+                multimodal_msg = self._create_multimodal_message(content, images)
+                logger.debug(f"[SDK Request] Multimodal message with {len(images)} image(s): {content[:100]}")
+                await client.query(multimodal_msg)
             else:
                 # 纯文本消息
+                logger.debug(f"[SDK Request] Text message: {content}")
                 await client.query(content)
 
             # 接收响应
@@ -295,21 +381,18 @@ class AgentSession:
                 # 从 ResultMessage 中提取 session_id（无论是否取消都要提取）
                 if isinstance(message, ResultMessage) and message.session_id:
                     self._session_id = message.session_id
-                    logger.info(f"Captured session_id from ResultMessage: {self._session_id}")
 
                 # 检查是否被取消 - 继续消费但丢弃消息，确保 SDK 响应流被完全清空
                 # 这样新查询不会收到旧查询的消息
                 if self._cancelled:
                     discarded_count += 1
-                    logger.debug(f"Query #{query_id} cancelled, discarding message #{discarded_count}: {type(message).__name__}")
                     continue  # 继续消费以清空 SDK 缓冲区
                 # 检查是否仍然是活跃查询
                 if query_id != self._active_query_id:
                     discarded_count += 1
-                    logger.debug(f"Query #{query_id} no longer active (current: #{self._active_query_id}), discarding message #{discarded_count}")
                     continue
                 message_count += 1
-                logger.debug(f"Received message #{message_count} for query #{query_id}: {type(message).__name__}")
+                logger.debug(f"[SDK Response] #{message_count}: {type(message).__name__} - {message}")
                 await self._message_queue.put(message)
 
             if discarded_count > 0:
@@ -384,23 +467,8 @@ class AgentSession:
                         pass
 
             # 关闭当前客户端
-            # 注意：由于 anyio cancel scope 的限制，__aexit__ 必须在与 __aenter__ 相同的任务中调用
-            # 如果在不同任务中调用会报错，这里捕获并忽略该错误
             async with self._client_lock:
-                if self._client is not None:
-                    try:
-                        await self._client.__aexit__(None, None, None)
-                        logger.info("ClaudeSDKClient closed for reset")
-                    except RuntimeError as e:
-                        # 忽略 "cancel scope in a different task" 错误
-                        # 这在重置时是预期的行为，因为 reset 可能从不同的任务调用
-                        if "cancel scope" in str(e):
-                            logger.debug(f"ClaudeSDKClient closed with expected task context warning: {e}")
-                        else:
-                            logger.warning(f"Error closing ClaudeSDKClient during reset: {e}")
-                    except Exception as e:
-                        logger.warning(f"Error closing ClaudeSDKClient during reset: {e}")
-                    self._client = None
+                await self._close_client("reset")
 
             # 重置状态
             self._cancelled = False
@@ -428,25 +496,4 @@ class AgentSession:
                 await self._current_task
             except asyncio.CancelledError:
                 pass
-        # 关闭 ClaudeSDKClient
-        # 注意：由于 anyio cancel scope 的限制，__aexit__ 必须在与 __aenter__ 相同的任务中调用
-        # 如果在不同任务中调用会报错，这里捕获并忽略该错误
-        if self._client is not None:
-            try:
-                await self._client.__aexit__(None, None, None)
-                logger.info("ClaudeSDKClient closed")
-            except RuntimeError as e:
-                # 忽略 "cancel scope in a different task" 错误
-                # 这在服务关闭时是预期的行为
-                if "cancel scope" in str(e):
-                    logger.debug(f"ClaudeSDKClient closed with expected task context warning: {e}")
-                else:
-                    logger.warning(f"Error closing ClaudeSDKClient: {e}")
-            except Exception as e:
-                error_str = str(e)
-                # 忽略 SIGINT (exit code -2) 导致的错误，这是 Ctrl+C 中断的正常行为
-                if "exit code -2" in error_str or "exit code: -2" in error_str:
-                    logger.debug(f"ClaudeSDKClient closed due to SIGINT (Ctrl+C)")
-                else:
-                    logger.warning(f"Error closing ClaudeSDKClient: {e}")
-            self._client = None
+        await self._close_client()
